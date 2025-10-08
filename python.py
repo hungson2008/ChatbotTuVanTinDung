@@ -1,185 +1,190 @@
-# python.py
-
+# app.py
 import streamlit as st
 import pandas as pd
-from google import genai
-from google.genai.errors import APIError
+import numpy as np
+import json
+import math
+import os
 
-# --- Cấu hình Trang Streamlit ---
-st.set_page_config(
-    page_title="App Phân Tích Báo Cáo Tài Chính",
-    layout="wide"
-)
+# Optional: OpenAI for NLP explanations (tùy chọn)
+USE_OPENAI = True
+try:
+    import openai
+    from dotenv import load_dotenv
+    load_dotenv()
+    if os.getenv("OPENAI_API_KEY"):
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+    else:
+        # nếu không có API key thì tắt
+        USE_OPENAI = False
+except Exception:
+    USE_OPENAI = False
 
-st.title("Ứng dụng Phân Tích Báo Cáo Tài Chính 📊")
+# ---------- Helper functions ----------
+def load_products(path="loan_products.json"):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
 
-# --- Hàm tính toán chính (Sử dụng Caching để Tối ưu hiệu suất) ---
-@st.cache_data
-def process_financial_data(df):
-    """Thực hiện các phép tính Tăng trưởng và Tỷ trọng."""
-    
-    # Đảm bảo các giá trị là số để tính toán
-    numeric_cols = ['Năm trước', 'Năm sau']
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    
-    # 1. Tính Tốc độ Tăng trưởng
-    # Dùng .replace(0, 1e-9) cho Series Pandas để tránh lỗi chia cho 0
-    df['Tốc độ tăng trưởng (%)'] = (
-        (df['Năm sau'] - df['Năm trước']) / df['Năm trước'].replace(0, 1e-9)
-    ) * 100
+def monthly_payment(principal, annual_rate_percent, months, method="annuity"):
+    """
+    Trả về payment hàng tháng theo lãi suất hàng năm (phần trăm).
+    method: "annuity" (nộp đều) hoặc "flat" (lãi theo dư nợ ban đầu - mô phỏng)
+    """
+    if months <= 0:
+        return 0.0
+    r = annual_rate_percent / 100.0 / 12.0  # monthly rate decimal
+    if method == "annuity":
+        if r == 0:
+            return principal / months
+        payment = principal * r / (1 - (1 + r) ** (-months))
+        return payment
+    elif method == "flat":
+        # simple flat: monthly = principal/months + (principal * annual_rate_percent/100)/12
+        monthly_interest = principal * (annual_rate_percent / 100.0) / 12.0
+        return principal / months + monthly_interest
+    else:
+        raise ValueError("Unknown method")
 
-    # 2. Tính Tỷ trọng theo Tổng Tài sản
-    # Lọc chỉ tiêu "TỔNG CỘNG TÀI SẢN"
-    tong_tai_san_row = df[df['Chỉ tiêu'].str.contains('TỔNG CỘNG TÀI SẢN', case=False, na=False)]
-    
-    if tong_tai_san_row.empty:
-        raise ValueError("Không tìm thấy chỉ tiêu 'TỔNG CỘNG TÀI SẢN'.")
+def amortization_schedule(principal, annual_rate_percent, months):
+    r = annual_rate_percent / 100.0 / 12.0
+    payment = monthly_payment(principal, annual_rate_percent, months, method="annuity")
+    schedule = []
+    remaining = principal
+    for m in range(1, months + 1):
+        interest = remaining * r
+        principal_paid = payment - interest
+        remaining = remaining - principal_paid
+        schedule.append({
+            "month": m,
+            "payment": round(payment, 2),
+            "interest": round(interest, 2),
+            "principal_paid": round(principal_paid, 2),
+            "remaining": round(max(0.0, remaining), 2)
+        })
+    return pd.DataFrame(schedule)
 
-    tong_tai_san_N_1 = tong_tai_san_row['Năm trước'].iloc[0]
-    tong_tai_san_N = tong_tai_san_row['Năm sau'].iloc[0]
+def eligibility_check(monthly_income, monthly_payment_amount, min_income, dti_threshold=0.4):
+    """
+    DTI threshold: tối đa phần trăm thu nhập dành cho trả nợ (ví dụ 0.4 = 40%)
+    """
+    dti = monthly_payment_amount / monthly_income if monthly_income > 0 else 1.0
+    pass_dti = dti <= dti_threshold
+    pass_min_income = monthly_income >= min_income
+    return {
+        "monthly_income": monthly_income,
+        "monthly_payment": monthly_payment_amount,
+        "dti": dti,
+        "pass_dti": pass_dti,
+        "pass_min_income": pass_min_income
+    }
 
-    # ******************************* PHẦN SỬA LỖI BẮT ĐẦU *******************************
-    # Lỗi xảy ra khi dùng .replace() trên giá trị đơn lẻ (numpy.int64).
-    # Sử dụng điều kiện ternary để xử lý giá trị 0 thủ công cho mẫu số.
-    
-    divisor_N_1 = tong_tai_san_N_1 if tong_tai_san_N_1 != 0 else 1e-9
-    divisor_N = tong_tai_san_N if tong_tai_san_N != 0 else 1e-9
-
-    # Tính tỷ trọng với mẫu số đã được xử lý
-    df['Tỷ trọng Năm trước (%)'] = (df['Năm trước'] / divisor_N_1) * 100
-    df['Tỷ trọng Năm sau (%)'] = (df['Năm sau'] / divisor_N) * 100
-    # ******************************* PHẦN SỬA LỖI KẾT THÚC *******************************
-    
-    return df
-
-# --- Hàm gọi API Gemini ---
-def get_ai_analysis(data_for_ai, api_key):
-    """Gửi dữ liệu phân tích đến Gemini API và nhận nhận xét."""
+def explain_with_openai(system_prompt, user_prompt):
+    if not USE_OPENAI:
+        return "OpenAI API key not provided or disabled. Chọn 'Use OpenAI' và thiết lập OPENAI_API_KEY để bật tính năng diễn giải ngôn ngữ tự nhiên."
     try:
-        client = genai.Client(api_key=api_key)
-        model_name = 'gemini-2.5-flash' 
-
-        prompt = f"""
-        Bạn là một chuyên gia phân tích tài chính chuyên nghiệp. Dựa trên các chỉ số tài chính sau, hãy đưa ra một nhận xét khách quan, ngắn gọn (khoảng 3-4 đoạn) về tình hình tài chính của doanh nghiệp. Đánh giá tập trung vào tốc độ tăng trưởng, thay đổi cơ cấu tài sản và khả năng thanh toán hiện hành.
-        
-        Dữ liệu thô và chỉ số:
-        {data_for_ai}
-        """
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini", # or "gpt-4o" or another model you have access to
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=500,
+            temperature=0.2
         )
-        return response.text
-
-    except APIError as e:
-        return f"Lỗi gọi Gemini API: Vui lòng kiểm tra Khóa API hoặc giới hạn sử dụng. Chi tiết lỗi: {e}"
-    except KeyError:
-        return "Lỗi: Không tìm thấy Khóa API 'GEMINI_API_KEY'. Vui lòng kiểm tra cấu hình Secrets trên Streamlit Cloud."
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        return f"Đã xảy ra lỗi không xác định: {e}"
+        return f"OpenAI error: {str(e)}"
 
+# ---------- Streamlit UI ----------
+st.set_page_config(page_title="Loan Advisor Bot (Agribank - Demo)", layout="wide")
+st.title("Chatbot tư vấn tín dụng — Mô phỏng Agribank")
 
-# --- Chức năng 1: Tải File ---
-uploaded_file = st.file_uploader(
-    "1. Tải file Excel Báo cáo Tài chính (Chỉ tiêu | Năm trước | Năm sau)",
-    type=['xlsx', 'xls']
-)
+st.sidebar.header("Thiết lập")
+products = load_products()
+product_map = {p["name"]: p for p in products}
+product_names = list(product_map.keys())
+selected_name = st.sidebar.selectbox("Chọn gói vay (mô phỏng)", product_names)
+product = product_map[selected_name]
 
-if uploaded_file is not None:
-    try:
-        df_raw = pd.read_excel(uploaded_file)
-        
-        # Tiền xử lý: Đảm bảo chỉ có 3 cột quan trọng
-        df_raw.columns = ['Chỉ tiêu', 'Năm trước', 'Năm sau']
-        
-        # Xử lý dữ liệu
-        df_processed = process_financial_data(df_raw.copy())
+principal = st.sidebar.number_input("Số tiền vay (VND)", min_value=0, value=100_000_000, step=1_000_000, format="%d")
+term_months = st.sidebar.number_input("Kỳ hạn (tháng)", min_value=1, value=60, step=1)
+monthly_income = st.sidebar.number_input("Thu nhập hàng tháng (VND)", min_value=0, value=20_000_000, step=100_000, format="%d")
+repayment_method = st.sidebar.selectbox("Phương thức trả nợ", ["annuity (trả đều)", "flat (trả gốc + lãi cố định)"])
+use_openai = st.sidebar.checkbox("Use OpenAI để diễn giải lời tư vấn (tùy chọn)", value=False)
 
-        if df_processed is not None:
-            
-            # --- Chức năng 2 & 3: Hiển thị Kết quả ---
-            st.subheader("2. Tốc độ Tăng trưởng & 3. Tỷ trọng Cơ cấu Tài sản")
-            st.dataframe(df_processed.style.format({
-                'Năm trước': '{:,.0f}',
-                'Năm sau': '{:,.0f}',
-                'Tốc độ tăng trưởng (%)': '{:.2f}%',
-                'Tỷ trọng Năm trước (%)': '{:.2f}%',
-                'Tỷ trọng Năm sau (%)': '{:.2f}%'
-            }), use_container_width=True)
-            
-            # --- Chức năng 4: Tính Chỉ số Tài chính ---
-            st.subheader("4. Các Chỉ số Tài chính Cơ bản")
-            
-            try:
-                # Lọc giá trị cho Chỉ số Thanh toán Hiện hành (Ví dụ)
-                
-                # Lấy Tài sản ngắn hạn
-                tsnh_n = df_processed[df_processed['Chỉ tiêu'].str.contains('TÀI SẢN NGẮN HẠN', case=False, na=False)]['Năm sau'].iloc[0]
-                tsnh_n_1 = df_processed[df_processed['Chỉ tiêu'].str.contains('TÀI SẢN NGẮN HẠN', case=False, na=False)]['Năm trước'].iloc[0]
+st.header("Thông tin gói vay (mô phỏng)")
+st.write(f"**{product['name']}** — Lãi suất hàng năm (mô phỏng): **{product['annual_rate_percent']}%**")
+st.write(f"Khoảng: {product['min_amount']:,} VND — {product['max_amount']:,} VND")
+st.write(f"Kỳ hạn tối thiểu/tối đa: {product['min_term_months']} tháng / {product['max_term_months']} tháng")
+st.write("Hồ sơ bắt buộc (mô phỏng): " + ", ".join(product.get("required_documents", [])))
 
-                # Lấy Nợ ngắn hạn (Dùng giá trị giả định hoặc lọc từ file nếu có)
-                # **LƯU Ý: Thay thế logic sau nếu bạn có Nợ Ngắn Hạn trong file**
-                no_ngan_han_N = df_processed[df_processed['Chỉ tiêu'].str.contains('NỢ NGẮN HẠN', case=False, na=False)]['Năm sau'].iloc[0]  
-                no_ngan_han_N_1 = df_processed[df_processed['Chỉ tiêu'].str.contains('NỢ NGẮN HẠN', case=False, na=False)]['Năm trước'].iloc[0]
+# Validate inputs vs product
+errors = []
+if principal < product["min_amount"] or principal > product["max_amount"]:
+    errors.append("Số tiền vay nằm ngoài phạm vi gói vay.")
+if term_months < product["min_term_months"] or term_months > product["max_term_months"]:
+    errors.append("Kỳ hạn nằm ngoài phạm vi gói vay.")
+if monthly_income < 0:
+    errors.append("Thu nhập không hợp lệ.")
 
-                # Tính toán
-                thanh_toan_hien_hanh_N = tsnh_n / no_ngan_han_N
-                thanh_toan_hien_hanh_N_1 = tsnh_n_1 / no_ngan_han_N_1
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric(
-                        label="Chỉ số Thanh toán Hiện hành (Năm trước)",
-                        value=f"{thanh_toan_hien_hanh_N_1:.2f} lần"
-                    )
-                with col2:
-                    st.metric(
-                        label="Chỉ số Thanh toán Hiện hành (Năm sau)",
-                        value=f"{thanh_toan_hien_hanh_N:.2f} lần",
-                        delta=f"{thanh_toan_hien_hanh_N - thanh_toan_hien_hanh_N_1:.2f}"
-                    )
-                    
-            except IndexError:
-                 st.warning("Thiếu chỉ tiêu 'TÀI SẢN NGẮN HẠN' hoặc 'NỢ NGẮN HẠN' để tính chỉ số.")
-                 thanh_toan_hien_hanh_N = "N/A" # Dùng để tránh lỗi ở Chức năng 5
-                 thanh_toan_hien_hanh_N_1 = "N/A"
-            
-            # --- Chức năng 5: Nhận xét AI ---
-            st.subheader("5. Nhận xét Tình hình Tài chính (AI)")
-            
-            # Chuẩn bị dữ liệu để gửi cho AI
-            data_for_ai = pd.DataFrame({
-                'Chỉ tiêu': [
-                    'Toàn bộ Bảng phân tích (dữ liệu thô)', 
-                    'Tăng trưởng Tài sản ngắn hạn (%)', 
-                    'Thanh toán hiện hành (N-1)', 
-                    'Thanh toán hiện hành (N)'
-                ],
-                'Giá trị': [
-                    df_processed.to_markdown(index=False),
-                    f"{df_processed[df_processed['Chỉ tiêu'].str.contains('TÀI SẢN NGẮN HẠN', case=False, na=False)]['Tốc độ tăng trưởng (%)'].iloc[0]:.2f}%", 
-                    f"{thanh_toan_hien_hanh_N_1}", 
-                    f"{thanh_toan_hien_hanh_N}"
-                ]
-            }).to_markdown(index=False) 
+if errors:
+    st.error(" / ".join(errors))
 
-            if st.button("Yêu cầu AI Phân tích"):
-                api_key = st.secrets.get("GEMINI_API_KEY") 
-                
-                if api_key:
-                    with st.spinner('Đang gửi dữ liệu và chờ Gemini phân tích...'):
-                        ai_result = get_ai_analysis(data_for_ai, api_key)
-                        st.markdown("**Kết quả Phân tích từ Gemini AI:**")
-                        st.info(ai_result)
-                else:
-                     st.error("Lỗi: Không tìm thấy Khóa API. Vui lòng cấu hình Khóa 'GEMINI_API_KEY' trong Streamlit Secrets.")
+# Compute payment
+monthly = monthly_payment(principal, product["annual_rate_percent"], int(term_months),
+                          method="annuity" if repayment_method.startswith("annuity") else "flat")
+st.subheader("Kết quả mô phỏng")
+st.write(f"- Thanh toán hàng tháng (ước tính): **{round(monthly):,} VND**")
+st.write(f"- Tổng số tiền phải trả (approx): **{round(monthly*term_months):,} VND**")
+st.write(f"- Tổng lãi ước tính: **{round(monthly*term_months - principal):,} VND**")
 
-    except ValueError as ve:
-        st.error(f"Lỗi cấu trúc dữ liệu: {ve}")
-    except Exception as e:
-        st.error(f"Có lỗi xảy ra khi đọc hoặc xử lý file: {e}. Vui lòng kiểm tra định dạng file.")
+# Eligibility check (DTI)
+elig = eligibility_check(monthly_income, monthly, product["min_monthly_income"], dti_threshold=0.4)
+st.subheader("Kiểm tra điều kiện cơ bản")
+st.write(f"- Tỷ lệ trả nợ trên thu nhập (DTI): **{elig['dti']*100:.1f}%** (ngưỡng mặc định: 40%)")
+st.write(f"- Thu nhập tối thiểu yêu cầu: **{product['min_monthly_income']:,} VND**")
+st.write(f"- Kết luận DTI hợp lệ? **{elig['pass_dti']}**")
+st.write(f"- Thu nhập tối thiểu đạt? **{elig['pass_min_income']}**")
 
-else:
-    st.info("Vui lòng tải lên file Excel để bắt đầu phân tích.")
+if not (elig['pass_dti'] and elig['pass_min_income']):
+    st.warning("KHÔNG đạt điều kiện tối thiểu theo quy tắc mô phỏng. Vui lòng điều chỉnh số liệu hoặc chọn gói khác.")
+
+# Show amortization schedule button
+if st.button("Hiện bảng trả nợ (amortization schedule)"):
+    df_schedule = amortization_schedule(principal, product["annual_rate_percent"], int(term_months))
+    st.dataframe(df_schedule)
+
+# Chat-like advisor: người dùng mô tả yêu cầu -> bot trả lời (cơ bản)
+st.subheader("Chat tư vấn (mô phỏng)")
+user_input = st.text_area("Nhập câu hỏi tư vấn của khách hàng:", value="Tôi muốn vay 500 triệu trong 5 năm, thu nhập 30 triệu/tháng. Tôi có đủ điều kiện không?")
+
+if st.button("Gửi câu hỏi"):
+    # Simple rule-based answer + injection of computed numbers
+    reply_lines = []
+    reply_lines.append(f"Bạn hỏi: \"{user_input}\"")
+    reply_lines.append("")
+    reply_lines.append("Kết quả mô phỏng nhanh:")
+    reply_lines.append(f"- Gói: {product['name']}")
+    reply_lines.append(f"- Số tiền: {principal:,} VND; Kỳ hạn: {term_months} tháng; Lãi suất (mô phỏng): {product['annual_rate_percent']}%/năm")
+    reply_lines.append(f"- Thanh toán hàng tháng ước tính: {round(monthly):,} VND")
+    reply_lines.append(f"- Tỷ lệ trả nợ trên thu nhập (DTI): {elig['dti']*100:.1f}% (ngưỡng 40%)")
+    if elig['pass_dti'] and elig['pass_min_income']:
+        reply_lines.append("- Theo mô phỏng, bạn **có thể đáp ứng** điều kiện cơ bản về thu nhập/DTI.")
+    else:
+        reply_lines.append("- Theo mô phỏng, bạn **không đáp ứng** điều kiện cơ bản. Cần xem xét giảm số tiền vay hoặc kéo dài kỳ hạn, hoặc tăng thu nhập chứng minh.")
+    reply_text = "\n".join(reply_lines)
+
+    if use_openai and USE_OPENAI:
+        system_prompt = "Bạn là chuyên gia tư vấn tín dụng ngân hàng. Giải thích cho khách hàng bằng tiếng Việt, rõ ràng, ngắn gọn, nêu ra các bước tiếp theo cần chuẩn bị hồ sơ."
+        user_prompt = "Dữ liệu: \n" + reply_text + "\nHãy diễn giải thành lời tư vấn thân thiện, bao gồm danh sách giấy tờ cần chuẩn bị và khuyến nghị cụ thể."
+        ai_answer = explain_with_openai(system_prompt, user_prompt)
+        st.markdown("### Lời khuyên (do AI diễn giải):")
+        st.write(ai_answer)
+    else:
+        st.markdown("### Lời khuyên (mô phỏng):")
+        st.write(reply_text)
+        st.write("- Hồ sơ cần chuẩn bị (mô phỏng): " + ", ".join(product.get("required_documents", [])))
+        st.write("- Bước tiếp theo: 1) Đến chi nhánh để tư vấn chi tiết; 2) Nộp hồ sơ và sao kê thu nhập; 3) Ngân hàng thẩm định giá trị tài sản/khả năng trả nợ.")
+
+st.info("Lưu ý: Kết quả trên là mô phỏng. Để biết quyết định chính thức, cần thẩm định bởi bộ phận tín dụng Agribank.")
